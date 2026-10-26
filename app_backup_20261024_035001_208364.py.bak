@@ -1,0 +1,502 @@
+import ctypes as C
+from ctypes import wintypes as W
+import json, time, threading, queue, re
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, messagebox
+try: C.windll.user32.SetProcessDpiAwarenessContext(C.c_void_p(-4))
+except Exception: pass
+import cv2
+import numpy as np
+import mss
+from PIL import Image, ImageTk
+
+U=C.WinDLL('user32',use_last_error=True)
+U.GetForegroundWindow.restype=W.HWND
+U.IsWindow.argtypes=[W.HWND]; U.IsWindow.restype=W.BOOL
+U.GetClientRect.argtypes=[W.HWND,C.POINTER(W.RECT)]
+U.ClientToScreen.argtypes=[W.HWND,C.POINTER(W.POINT)]
+U.GetWindowTextLengthW.argtypes=[W.HWND]
+U.GetWindowTextW.argtypes=[W.HWND,W.LPWSTR,C.c_int]
+U.IsWindowVisible.argtypes=[W.HWND]
+U.GetAsyncKeyState.argtypes=[C.c_int]; U.GetAsyncKeyState.restype=C.c_short
+PTR=C.c_size_t
+class MI(C.Structure): _fields_=[('dx',W.LONG),('dy',W.LONG),('mouseData',W.DWORD),('dwFlags',W.DWORD),('time',W.DWORD),('extra',PTR)]
+class KI(C.Structure): _fields_=[('vk',W.WORD),('scan',W.WORD),('flags',W.DWORD),('time',W.DWORD),('extra',PTR)]
+class UNION(C.Union): _fields_=[('mi',MI),('ki',KI)]
+class INPUT(C.Structure): _fields_=[('type',W.DWORD),('u',UNION)]
+U.SendInput.argtypes=[W.UINT,C.POINTER(INPUT),C.c_int]; U.SendInput.restype=W.UINT
+ENUM=C.WINFUNCTYPE(W.BOOL,W.HWND,W.LPARAM)
+U.EnumWindows.argtypes=[ENUM,W.LPARAM]
+
+def windows():
+    found=[]
+    @ENUM
+    def cb(h,p):
+        if U.IsWindowVisible(h):
+            n=U.GetWindowTextLengthW(h)
+            b=C.create_unicode_buffer(n+1); U.GetWindowTextW(h,b,n+1)
+            if b.value: found.append((int(h),b.value))
+        return True
+    U.EnumWindows(cb,0)
+    return found
+
+def geometry(h):
+    r=W.RECT(); p=W.POINT()
+    if not U.IsWindow(h) or not U.GetClientRect(h,C.byref(r)) or not U.ClientToScreen(h,C.byref(p)):
+        raise RuntimeError('Oyun penceresi artik gecerli degil')
+    if r.right<100 or r.bottom<100: raise RuntimeError('Gecersiz pencere boyutu')
+    return p.x,p.y,r.right,r.bottom
+
+def feature(bgr,color):
+    hsv=cv2.cvtColor(bgr,cv2.COLOR_BGR2HSV)
+    h,s,v=cv2.split(hsv)
+    if color=='red': mask=((h<=13)|(h>=170))&(s>=85)&(v>=55)
+    elif color=='purple': mask=(h>=115)&(h<=169)&(s>=40)&(v>=65)
+    else: mask=(s<=100)&(v>=155)
+    return mask.astype(np.float32)
+
+def detect(image,templ,color,threshold,scales):
+    scene=feature(image,color); base=feature(templ,color)
+    candidates=[]
+    for scale in scales:
+        w=max(3,round(base.shape[1]*scale)); h=max(3,round(base.shape[0]*scale))
+        if w>scene.shape[1] or h>scene.shape[0]: continue
+        t=cv2.resize(base,(w,h),interpolation=cv2.INTER_NEAREST)
+        mass=float(t.sum())
+        if mass<15: continue
+        dot=cv2.matchTemplate(scene,t,cv2.TM_CCORR)
+        integral=cv2.integral(scene)
+        totals=integral[h:,w:]-integral[:-h,w:]-integral[h:,:-w]+integral[:-h,:-w]
+        score=np.clip(2*dot/(totals+mass+1e-6),0,1).astype(np.float32)
+        for _ in range(16):
+            _,val,_,loc=cv2.minMaxLoc(score)
+            if val<threshold: break
+            x,y=loc; candidates.append((float(val),x,y,w,h))
+            score[max(0,y-h//2):y+h//2+1,max(0,x-w//2):x+w//2+1]=0
+    candidates.sort(reverse=True); kept=[]
+    for c in candidates:
+        _,x,y,w,h=c
+        if all(abs(x+w/2-(k[1]+k[3]/2))>max(w,k[3])*0.55 or abs(y+h/2-(k[2]+k[4]/2))>max(h,k[4])*0.6 for k in kept): kept.append(c)
+    return kept
+def clean_panel_colors(panel, template, color):
+    if color != 'purple':
+        return panel, template
+
+    template_hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+    valid = feature(template, 'purple') > 0
+
+    if int(valid.sum()) < 15:
+        raise RuntimeError(
+            "Panel orneginde yeterli mor yazi pikseli yok"
+        )
+
+    hues = template_hsv[:, :, 0][valid]
+    histogram = np.bincount(hues, minlength=180)
+    dominant_hue = int(histogram.argmax())
+
+    def filtered(image):
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0].astype(np.int16)
+
+        difference = np.abs(hue - dominant_hue)
+        difference = np.minimum(difference, 180 - difference)
+
+        keep = (
+            (difference <= 8)
+            & (hsv[:, :, 1] >= 40)
+            & (hsv[:, :, 2] >= 65)
+        )
+
+        result = image.copy()
+        result[~keep] = 0
+        return result
+
+    return filtered(panel), filtered(template)
+ROOT=Path(__file__).resolve().parent
+DATA=ROOT/'profiles'; DATA.mkdir(exist_ok=True)
+class App:
+    def __init__(self,root):
+        self.root=root; root.title('Aurora Vision 2 - Calibration Build')
+        self.stop=threading.Event(); self.bus=queue.Queue(); self.worker=None; self.samples={}; self.region={}; self.size=None
+        self.vars={}; self.window_map={}; self.photo=None
+        controls=ttk.Frame(root); controls.pack(fill='x')
+        self.win=tk.StringVar(); self.combo=ttk.Combobox(controls,textvariable=self.win,width=60,state='readonly'); self.combo.grid(row=0,column=1,columnspan=2)
+        ttk.Button(controls,text='Pencereleri yenile',command=self.refresh).grid(row=0,column=0)
+        fields=[('profile','Profil / mob adi','Hob Goblin'),('mode','Mod','Dry'),('scene_color','Sahne yazi rengi','red'),('panel_color','Ust panel yazi rengi','purple'),('threshold','Eslesme esigi (0..1)','0.80'),('offset','Ismin ALTINDAN tiklama px','30'),('skills','Tus sirasi','f1,1'),('delay','Tus araligi saniye','0.30'),('timeout','Azami saldiri saniye','20')]
+        for row,(key,label,value) in enumerate(fields,1):
+            ttk.Label(controls,text=label).grid(row=row,column=0,sticky='w')
+            v=tk.StringVar(value=value); self.vars[key]=v
+            if key in ('mode','scene_color','panel_color'):
+                values=['Dry','Click test','Farm','Z Farm'] if key=='mode' else ['red','purple','light']
+                ttk.Combobox(controls,textvariable=v,values=values,state='readonly').grid(row=row,column=1,sticky='ew')
+            else: ttk.Entry(controls,textvariable=v,width=32).grid(row=row,column=1,sticky='ew')
+        buttons=ttk.Frame(root); buttons.pack(fill='x')
+        for text,cmd in [('1 Sahne alani',lambda:self.pick('scene',False)),('2 Ust ad alani',lambda:self.pick('panel',False)),('3 Sahne isim ORNEGI',lambda:self.pick('scene',True)),('4 Ust ad ORNEGI',lambda:self.pick('panel',True)),('Profil kaydet',self.save),('Profil yukle',self.load),('Baslat (5 sn)',self.start),('DUR / F12',self.stop.set)]:
+            ttk.Button(buttons,text=text,command=cmd).pack(side='left',padx=2,pady=5)
+        self.view=ttk.Label(root); self.view.pack()
+        self.log=tk.Text(root,width=125,height=9); self.log.pack(fill='both',expand=True)
+        self.refresh(); root.after(80,self.poll)
+        threading.Thread(target=self.hotkey,daemon=True).start()
+        root.protocol('WM_DELETE_WINDOW',self.close)
+
+    def say(self,s): self.bus.put(('log',str(s)))
+    def active(self): return self.worker is not None and self.worker.is_alive()
+    def refresh(self):
+        self.window_map={f'{title} [0x{h:x}]':h for h,title in windows() if title!='Aurora Vision 2 - Calibration Build'}
+        self.combo['values']=list(self.window_map)
+        for label in self.window_map:
+            if 'knight' in label.lower(): self.win.set(label); break
+    def hwnd(self):
+        if self.win.get() not in self.window_map: raise ValueError('Oyun penceresini listeden sec')
+        return self.window_map[self.win.get()]
+    def hotkey(self):
+        while True:
+            if U.GetAsyncKeyState(0x7B)&0x8000: self.stop.set()
+            time.sleep(0.015)
+    def close(self): self.stop.set(); self.root.destroy()
+    def poll(self):
+        for _ in range(100):
+            try: kind,value=self.bus.get_nowait()
+            except queue.Empty: break
+            if kind=='log': self.log.insert('end',value+'\n'); self.log.see('end')
+            elif kind=='image':
+                self.photo=ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(value,cv2.COLOR_BGR2RGB)))
+                self.view.configure(image=self.photo)
+        self.root.after(80,self.poll)
+    def capture(self,sct,h):
+        x,y,w,hh=geometry(h)
+        if self.size and [w,hh]!=self.size: raise RuntimeError('Pencere boyutu degisti; yeniden kalibre et')
+        return np.array(sct.grab(dict(left=x,top=y,width=w,height=hh)))[:,:,:3].copy()
+    def pick(self,key,sample):
+        if self.active(): return
+        try: h=self.hwnd()
+        except Exception as e: messagebox.showerror('Pencere',str(e)); return
+        self.root.withdraw(); self.root.after(450,lambda:self.do_pick(h,key,sample))
+    def do_pick(self,h,key,sample):
+        try:
+            with mss.mss() as sct: image=self.capture(sct,h)
+            r=cv2.selectROI('Drag tight region, ENTER confirms / ESC cancels',image,False,False)
+            cv2.destroyAllWindows()
+            x,y,w,hh=map(int,r)
+            if w<4 or hh<4: return
+            self.size=[image.shape[1],image.shape[0]]
+            if sample:
+                color=self.vars[key+'_color'].get()
+                crop=image[y:y+hh,x:x+w].copy()
+                if feature(crop,color).sum()<15: raise ValueError('Secilen renkte yeterli yazi pikseli yok. Rengi veya kesiti duzelt.')
+                self.samples[key]=crop
+                self.say(f'{key} ornegi: {w}x{hh}, renk={color}')
+            else:
+                self.region[key]=[x,y,w,hh]; self.say(f'{key} alani: {self.region[key]}')
+        except Exception as e: self.say(e)
+        finally: self.root.deiconify()
+    def settings(self):
+        c={k:v.get().strip() for k,v in self.vars.items()}
+        c.update(region=self.region.copy(),size=self.size)
+        c['threshold']=float(c['threshold']); c['offset']=int(c['offset']); c['delay']=float(c['delay']); c['timeout']=float(c['timeout'])
+        if not .5<=c['threshold']<=.99 or c['delay']<.05 or not 1<=c['timeout']<=120: raise ValueError('Esik / sure gecersiz')
+        return c
+    def folder(self):
+        name=re.sub(r'[^\w -]','_',self.vars['profile'].get()).strip()
+        if not name: raise ValueError('Profil adi gerekli')
+        return DATA/name
+    def save(self):
+        if self.active(): return
+        try:
+            p=self.folder(); p.mkdir(exist_ok=True)
+            (p/'config.json').write_text(json.dumps(self.settings(),indent=2),encoding='utf-8')
+            for k,v in self.samples.items(): cv2.imencode('.png',v)[1].tofile(str(p/(k+'.png')))
+            self.say('Profil kaydedildi: '+p.name)
+        except Exception as e: self.say(e)
+    def load(self):
+        if self.active(): return
+        try:
+            p=self.folder(); c=json.loads((p/'config.json').read_text(encoding='utf-8'))
+            for k in self.vars:
+                if k in c: self.vars[k].set(str(c[k]))
+            self.region=c['region']; self.size=c['size']; self.samples={}
+            for k in ['scene','panel']:
+                if (p/(k+'.png')).exists(): self.samples[k]=cv2.imdecode(np.fromfile(str(p/(k+'.png')),dtype=np.uint8),cv2.IMREAD_COLOR)
+            self.say('Profil yuklendi')
+        except Exception as e: self.say(e)
+    def start(self):
+        if self.active(): self.say('Once mevcut testi durdur'); return
+        try:
+            c=self.settings(); h=self.hwnd()
+            required=['panel'] if c['mode']=='Z Farm' else ['scene','panel']
+            if any(k not in self.samples or k not in c['region'] for k in required): raise ValueError('Alanlari ve iki ayri isim ornegini sec')
+            samples={k:v.copy() for k,v in self.samples.items()}
+            self.keylist(c['skills'])
+        except Exception as e: messagebox.showerror('Ayar',str(e)); return
+        self.stop.clear(); self.worker=threading.Thread(target=self.run,args=(h,c,samples),daemon=True); self.worker.start()
+    def wait(self,t):
+        if self.stop.wait(t): raise InterruptedError()
+    def guard(self,h):
+        if self.stop.is_set(): raise InterruptedError()
+        if int(U.GetForegroundWindow() or 0)!=h: raise RuntimeError('Oyun odagi kayboldu; durduruldu')
+        if not U.IsWindow(h): raise RuntimeError('Pencere kapandi')
+    def send(self,i):
+        a=(INPUT*1)(i)
+        if U.SendInput(1,a,C.sizeof(INPUT))!=1: raise RuntimeError(f'SendInput basarisiz: {C.get_last_error()}')
+    def key(self,h,vk):
+        self.guard(h)
+        self.send(INPUT(type=1,u=UNION(ki=KI(vk=vk))))
+        try: self.wait(.035)
+        finally: self.send(INPUT(type=1,u=UNION(ki=KI(vk=vk,flags=2))))
+    def click(self, h, x, y):
+        self.guard(h)
+
+        U.GetCursorPos.argtypes = [C.POINTER(W.POINT)]
+        U.GetCursorPos.restype = W.BOOL
+
+        def position():
+            p = W.POINT()
+            if not U.GetCursorPos(C.byref(p)):
+                raise RuntimeError(
+                    f"GetCursorPos basarisiz: {C.get_last_error()}"
+                )
+            return p.x, p.y
+
+        before = position()
+
+        vx = U.GetSystemMetrics(76)
+        vy = U.GetSystemMetrics(77)
+        vw = U.GetSystemMetrics(78)
+        vh = U.GetSystemMetrics(79)
+
+        if vw <= 1 or vh <= 1:
+            raise RuntimeError("Sanal masaustu boyutu gecersiz")
+
+        if not (vx <= x < vx + vw and vy <= y < vy + vh):
+            raise RuntimeError(
+                f"Hedef masaustu disinda: ({x},{y})"
+            )
+
+        nx = round((x - vx) * 65535 / (vw - 1))
+        ny = round((y - vy) * 65535 / (vh - 1))
+
+        self.say(
+            f"FARE: once={before}, hedef ekran=({x},{y}), "
+            f"masaustu=({vx},{vy},{vw},{vh}), "
+            f"INPUT boyutu={C.sizeof(INPUT)}"
+        )
+
+        self.send(
+            INPUT(
+                type=0,
+                u=UNION(
+                    mi=MI(
+                        dx=nx,
+                        dy=ny,
+                        dwFlags=0x0001 | 0x8000 | 0x4000
+                    )
+                )
+            )
+        )
+
+        self.say(f"FARE: mutlak hareket sonrasi={position()}")
+
+        # C# projesindeki Nudge(1, 0)
+        self.guard(h)
+        self.send(
+            INPUT(
+                type=0,
+                u=UNION(mi=MI(dx=1, dy=0, dwFlags=0x0001))
+            )
+        )
+        self.wait(0.003)
+
+        # C# projesindeki Nudge(-1, 0)
+        self.guard(h)
+        self.send(
+            INPUT(
+                type=0,
+                u=UNION(mi=MI(dx=-1, dy=0, dwFlags=0x0001))
+            )
+        )
+        self.wait(0.003)
+
+        self.wait(0.060)
+        self.guard(h)
+
+        after = position()
+        self.say(f"FARE: hareket sonrasi={after}")
+
+        distance = (
+            (after[0] - x) ** 2 + (after[1] - y) ** 2
+        ) ** 0.5
+
+        if distance > 8:
+            raise RuntimeError(
+                f"Imlec hedefe ulasmadi; fark={distance:.1f}px. "
+                "Guvenlik nedeniyle tiklama gonderilmedi."
+            )
+
+        self.send(
+            INPUT(type=0, u=UNION(mi=MI(dwFlags=0x0002)))
+        )
+        try:
+            self.wait(0.12)
+        finally:
+            self.send(
+                INPUT(type=0, u=UNION(mi=MI(dwFlags=0x0004)))
+            )
+
+        self.say(
+            "Sol tus bas/birak komutlari gonderildi; "
+            "oyun ici secim ayrica dogrulanacak."
+        )
+    def keylist(self,text):
+        keys=[]
+        for s in text.lower().replace(' ','').split(','):
+            if len(s)==1 and s.isascii() and s.isalnum(): keys.append(ord(s.upper()))
+            elif re.fullmatch(r'f([1-9]|1[0-2])',s): keys.append(0x6F+int(s[1:]))
+            else: raise ValueError('Desteklenen tuslar: A-Z, 0-9, F1-F12')
+        return keys
+    def cut(self,image,r):
+        x,y,w,h=r
+        if x<0 or y<0 or x+w>image.shape[1] or y+h>image.shape[0]: raise RuntimeError('Alan pencere disinda')
+        return image[y:y+h,x:x+w]
+    def run(self,h,c,samples):
+        stats=[]
+        try:
+            self.say('5 saniye icinde listeden sectigin oyuna gec. F12 durdurur.'); self.wait(5)
+            live=c['mode']!='Dry'
+            if live: self.guard(h)
+            keys=self.keylist(c['skills']); nextclick=0; lastreport=0; engaged=False; since=0; idx=0; confirmations=0
+            with mss.mss() as sct:
+                def verify():
+                    self.guard(h)
+                    im = self.capture(sct, h)
+                    panel = self.cut(im, c['region']['panel'])
+
+                    panel, panel_template = clean_panel_colors(
+                        panel,
+                        samples['panel'],
+                        c['panel_color']
+                    )
+
+                    debug_dir = ROOT / 'debug'
+                    debug_dir.mkdir(exist_ok=True)
+
+                    images = {
+                        'panel_latest.png': panel,
+                        'panel_template.png': panel_template,
+                        'panel_mask.png': (
+                            feature(panel, c['panel_color']) * 255
+                        ).astype(np.uint8),
+                        'template_mask.png': (
+                            feature(
+                                panel_template,
+                                c['panel_color']
+                            ) * 255
+                        ).astype(np.uint8),
+                    }
+
+                    for filename, image in images.items():
+                        ok, encoded = cv2.imencode('.png', image)
+                        if not ok:
+                            raise RuntimeError(
+                                'Teshis goruntusu kodlanamadi'
+                            )
+                        encoded.tofile(str(debug_dir / filename))
+
+                    measured = detect(
+                        panel,
+                        panel_template,
+                        c['panel_color'],
+                        0.01,
+                        [1.0]
+                    )
+
+                    score = measured[0][0] if measured else 0.0
+                    accepted = score >= c['threshold']
+
+                    self.say(
+                        f"PANEL: skor={score:.3f}, "
+                        f"esik={c['threshold']:.2f}, "
+                        f"alan={panel.shape[1]}x{panel.shape[0]}, "
+                        f"ornek={panel_template.shape[1]}x"
+                        f"{panel_template.shape[0]}, "
+                        f"sonuc={'OK' if accepted else 'RED'}"
+                    )
+
+                    return accepted
+                while not self.stop.is_set():
+                    t=time.perf_counter()
+                    if live: self.guard(h)
+                    if engaged:
+                        if time.monotonic()-since>c['timeout']: raise RuntimeError('Hedef zaman asimi. Can barini elle kontrol et.')
+                        if not verify():
+                            engaged=False; self.say('Ust ad kayboldu; saldiri kesildi'); continue
+                        self.key(h,keys[idx%len(keys)]); idx+=1; self.wait(c['delay']); continue
+                    image=self.capture(sct,h)
+                    if c['mode']=='Z Farm':
+                        self.key(h,ord('Z')); self.wait(.25)
+                        if verify():
+                            self.wait(.1)
+                            if verify():
+                                self.key(h,ord('R')); engaged=True; since=time.monotonic(); idx=0
+                                self.say('Z hedefi dogrulandi')
+                        self.wait(.2); continue
+                    roi=c['region']['scene']; scene=self.cut(image,roi)
+                    hits=detect(scene,samples['scene'],c['scene_color'],c['threshold'],[.9,1,1.1])
+                    elapsed=(time.perf_counter()-t)*1000; stats.append(elapsed)
+                    draw=scene.copy()
+                    for score,x,y,w,hh in hits:
+                        cv2.rectangle(draw,(x,y),(x+w,y+hh),(0,255,0),1)
+                        cv2.drawMarker(draw,(x+w//2,y+hh+c['offset']),(0,255,255),cv2.MARKER_CROSS,12)
+                        cv2.putText(draw,f'{score:.2f}',(x,y-3),cv2.FONT_HERSHEY_SIMPLEX,.4,(255,255,255),1)
+                    if self.bus.qsize()<5:
+                        ratio=min(1,950/draw.shape[1],400/draw.shape[0])
+                        self.bus.put(('image',cv2.resize(draw,None,fx=ratio,fy=ratio)))
+                    if time.monotonic()-lastreport>1:
+                        self.say(f'Aday {len(hits)} | analiz {elapsed:.0f} ms'); lastreport=time.monotonic()
+                    if live and hits and time.monotonic()>nextclick:
+                        center=np.array([scene.shape[1]/2,scene.shape[0]/2])
+                        target=min(hits,key=lambda z:np.linalg.norm(np.array([z[1]+z[3]/2,z[2]+z[4]/2])-center))
+                        old=np.array([target[1]+target[3]/2,target[2]+target[4]/2])
+                        freshimage=self.capture(sct,h)
+                        fresh=detect(self.cut(freshimage,roi),samples['scene'],c['scene_color'],c['threshold'],[.9,1,1.1])
+                        if not fresh: continue
+                        current=min(fresh,key=lambda z:np.linalg.norm(np.array([z[1]+z[3]/2,z[2]+z[4]/2])-old))
+                        sc,x,y,w,hh=current
+                        if np.linalg.norm(np.array([x+w/2,y+hh/2])-old)>70: continue
+                        px=roi[0]+x+w//2; py=roi[1]+y+hh+c['offset']
+                        if not (roi[0]<=px<roi[0]+roi[2] and roi[1]<=py<roi[1]+roi[3]): continue
+                        ox,oy,_,_=geometry(h)
+                        self.click(h,ox+px,oy+py); nextclick=time.monotonic()+1.2
+                        self.say(f'Tiklama: client ({px},{py}), skor {sc:.2f}')
+                        good = False
+                        consecutive = 0
+                        deadline = time.monotonic() + 1.5
+
+                        self.wait(0.15)
+
+                        while time.monotonic() < deadline:
+                            self.guard(h)
+
+                            if verify():
+                                consecutive += 1
+                                if consecutive >= 2:
+                                    good = True
+                                    break
+                            else:
+                                consecutive = 0
+
+                            self.wait(0.10)
+                        self.say('UST HEDEF DOGRULANDI' if good else 'Dogrulama basarisiz; saldiri YOK')
+                        if c['mode']=='Click test': break
+                        if good:
+                            self.key(h,ord('R')); engaged=True; since=time.monotonic(); idx=0
+                    self.wait(.08)
+        except InterruptedError: self.say('Durdurma istegi islendi')
+        except Exception as e: self.say(f'HATA / DURDU: {e}')
+        finally:
+            self.stop.set()
+            if stats: self.say(f'Tarama medyan {np.median(stats):.0f} ms; p95 {np.percentile(stats,95):.0f} ms')
+            self.say('Calisma tamamlandi')
+
+if __name__=='__main__':
+    root=tk.Tk(); App(root); root.mainloop()

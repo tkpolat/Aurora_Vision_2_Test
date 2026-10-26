@@ -1,0 +1,29 @@
+{
+  "profile": "Worm",
+  "mode": "Dry",
+  "scene_color": "red",
+  "panel_color": "light",
+  "threshold": 0.8,
+  "offset": 30,
+  "skills": "f1,1,R",
+  "delay": 0.3,
+  "timeout": 20.0,
+  "region": {
+    "scene": [
+      627,
+      259,
+      1066,
+      396
+    ],
+    "panel": [
+      838,
+      8,
+      242,
+      81
+    ]
+  },
+  "size": [
+    1920,
+    1080
+  ]
+}
