@@ -385,7 +385,10 @@ class App:
         except Exception as e: self.say(e)
         finally: self.root.deiconify()
     def settings(self):
-        c={k:v.get().strip() for k,v in self.vars.items()}
+        c={}
+        for k,v in self.vars.items():
+            val=v.get()
+            c[k]=val if isinstance(val,bool) else str(val).strip()
         c.update(region=self.region.copy(),size=self.size,skill_rotation=getattr(self,'skill_rotation',None))
         c['threshold']=float(c['threshold']); c['offset']=int(c['offset']); c['delay']=float(c['delay']); c['timeout']=float(c['timeout'])
         if not .5<=c['threshold']<=.99 or c['delay']<.05 or not 1<=c['timeout']<=120: raise ValueError('Esik / sure gecersiz')
