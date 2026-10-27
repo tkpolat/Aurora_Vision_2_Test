@@ -60,6 +60,7 @@ def feature(bgr,color):
 def detect(image,templ,color,threshold,scales):
     scene=feature(image,color); base=feature(templ,color)
     candidates=[]
+    integral=cv2.integral(scene)
     for scale in scales:
         w=max(3,round(base.shape[1]*scale)); h=max(3,round(base.shape[0]*scale))
         if w>scene.shape[1] or h>scene.shape[0]: continue
@@ -67,10 +68,9 @@ def detect(image,templ,color,threshold,scales):
         mass=float(t.sum())
         if mass<15: continue
         dot=cv2.matchTemplate(scene,t,cv2.TM_CCORR)
-        integral=cv2.integral(scene)
         totals=integral[h:,w:]-integral[:-h,w:]-integral[h:,:-w]+integral[:-h,:-w]
         score=np.clip(2*dot/(totals+mass+1e-6),0,1).astype(np.float32)
-        for _ in range(16):
+        for _ in range(6):
             _,val,_,loc=cv2.minMaxLoc(score)
             if val<threshold: break
             x,y=loc; candidates.append((float(val),x,y,w,h))

@@ -15,7 +15,8 @@
   "loop_delay": 0.03,
   "verify_every": 3,
   "targets": [
-    "Ancient"
+    "Ancient",
+    "bulture"
   ],
   "wolf": {
     "enabled": false,
