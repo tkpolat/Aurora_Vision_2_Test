@@ -135,6 +135,7 @@ class App:
         self.stop=threading.Event(); self.bus=queue.Queue(); self.worker=None; self.samples={}; self.region={}; self.size=None
         self.vars={}; self.window_map={}; self.photo=None
         self.targets = {}
+        self._vc = 0
         root.columnconfigure(0, weight=1)
         root.rowconfigure(3, weight=1)
 
@@ -273,13 +274,16 @@ class App:
         ttk.Button(control_frame, text='Profil Yükle', command=self.load).grid(
             row=0, column=3, padx=6, pady=6, sticky='ew'
         )
+        ttk.Button(control_frame, text='Önizleme Penceresi (aç/kapat)', command=self.toggle_preview).grid(
+            row=1, column=0, columnspan=4, padx=6, pady=(0, 6), sticky='ew'
+        )
 
         for column in range(4):
             control_frame.columnconfigure(column, weight=1)
 
-        # Önizleme ve log
-        self.view = ttk.Label(root)
-        self.view.pack(padx=8, pady=4)
+        # Önizleme artik ayri pencerede
+        self.preview = None
+        self.view = None
 
         log_frame = ttk.LabelFrame(root, text=' Durum Günlüğü ')
         log_frame.pack(fill='both', expand=True, padx=8, pady=(4, 8))
@@ -311,17 +315,29 @@ class App:
         return self.window_map[self.win.get()]
     def hotkey(self):
         while True:
-            if U.GetAsyncKeyState(0x2D)&0x8000: self.stop.set()
+            if U.GetAsyncKeyState(0x2D)&0x8000: self.stop.set()   # Insert
+            if U.GetAsyncKeyState(0x7B)&0x8000: self.stop.set()   # F12
             time.sleep(0.015)
     def close(self): self.stop.set(); self.root.destroy()
+    def toggle_preview(self):
+        if self.preview is not None and self.preview.winfo_exists():
+            self.preview.destroy(); self.preview = None; self.view = None; return
+        self.preview = tk.Toplevel(self.root)
+        self.preview.title('Canli Onizleme')
+        self.preview.configure(bg='#121212')
+        self.preview.geometry('+40+40')
+        self.view = ttk.Label(self.preview)
+        self.view.pack(padx=4, pady=4)
+        self.preview.protocol('WM_DELETE_WINDOW', self.toggle_preview)
     def poll(self):
         for _ in range(100):
             try: kind,value=self.bus.get_nowait()
             except queue.Empty: break
             if kind=='log': self.log.insert('end',value+'\n'); self.log.see('end')
             elif kind=='image':
-                self.photo=ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(value,cv2.COLOR_BGR2RGB)))
-                self.view.configure(image=self.photo)
+                if self.view is not None and self.view.winfo_exists():
+                    self.photo=ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(value,cv2.COLOR_BGR2RGB)))
+                    self.view.configure(image=self.photo)
         self.root.after(80,self.poll)
     def capture(self,sct,h):
         x,y,w,hh=geometry(h)
@@ -433,8 +449,8 @@ class App:
             if c['mode']=='Panel test': required=['panel']
             elif c['mode'] in ('Z Farm','Genel Farm'): required=['panel','hp']
             else: required=['scene','panel','hp']
-            sample_required=['scene','panel']
-            region_required=['scene','panel','hp']
+            sample_required=[k for k in required if k in ('scene','panel')]
+            region_required=[k for k in required if k in ('scene','panel','hp')]
             missing=[k for k in sample_required if k not in self.samples]
             missing+=[k for k in region_required if k not in c['region']]
             if missing: raise ValueError('Eksik ogeler: ' + ', '.join(missing))
@@ -484,109 +500,58 @@ class App:
                     )
                 )
             )
-    def click(self, h, x, y):
-        self.guard(h)
-
+    def cursor(self):
         U.GetCursorPos.argtypes = [C.POINTER(W.POINT)]
         U.GetCursorPos.restype = W.BOOL
+        p = W.POINT()
+        if not U.GetCursorPos(C.byref(p)):
+            raise RuntimeError(f"GetCursorPos basarisiz: {C.get_last_error()}")
+        return p.x, p.y
 
-        def position():
-            p = W.POINT()
-            if not U.GetCursorPos(C.byref(p)):
-                raise RuntimeError(
-                    f"GetCursorPos basarisiz: {C.get_last_error()}"
-                )
-            return p.x, p.y
+    def dist_to(self, pos, x, y):
+        return ((pos[0] - x) ** 2 + (pos[1] - y) ** 2) ** 0.5
 
-        before = position()
-
-        vx = U.GetSystemMetrics(76)
-        vy = U.GetSystemMetrics(77)
-        vw = U.GetSystemMetrics(78)
-        vh = U.GetSystemMetrics(79)
-
+    def move_to(self, h, x, y):
+        self.guard(h)
+        vx = U.GetSystemMetrics(76); vy = U.GetSystemMetrics(77)
+        vw = U.GetSystemMetrics(78); vh = U.GetSystemMetrics(79)
         if vw <= 1 or vh <= 1:
             raise RuntimeError("Sanal masaustu boyutu gecersiz")
-
         if not (vx <= x < vx + vw and vy <= y < vy + vh):
-            raise RuntimeError(
-                f"Hedef masaustu disinda: ({x},{y})"
-            )
-
+            raise RuntimeError(f"Hedef masaustu disinda: ({x},{y})")
         nx = round((x - vx) * 65535 / (vw - 1))
         ny = round((y - vy) * 65535 / (vh - 1))
+        self.send(INPUT(type=0, u=UNION(mi=MI(dx=nx, dy=ny, dwFlags=0x0001 | 0x8000 | 0x4000))))
+        self.wait(0.05)
+        if self.dist_to(self.cursor(), x, y) <= 8:
+            return
+        U.SetCursorPos.argtypes = [C.c_int, C.c_int]
+        U.SetCursorPos.restype = W.BOOL
+        U.SetCursorPos(int(x), int(y))
+        self.wait(0.05)
+        if self.dist_to(self.cursor(), x, y) <= 8:
+            self.say("FARE: SetCursorPos ile tasindi")
+            return
+        raise RuntimeError(f"Imlec hedefe ulasmadi; fark={self.dist_to(self.cursor(), x, y):.1f}px")
 
-        self.say(
-            f"FARE: once={before}, hedef ekran=({x},{y}), "
-            f"masaustu=({vx},{vy},{vw},{vh}), "
-            f"INPUT boyutu={C.sizeof(INPUT)}"
-        )
-
-        self.send(
-            INPUT(
-                type=0,
-                u=UNION(
-                    mi=MI(
-                        dx=nx,
-                        dy=ny,
-                        dwFlags=0x0001 | 0x8000 | 0x4000
-                    )
-                )
-            )
-        )
-
-        self.say(f"FARE: mutlak hareket sonrasi={position()}")
-
-        # C# projesindeki Nudge(1, 0)
+    def click(self, h, x, y):
         self.guard(h)
-        self.send(
-            INPUT(
-                type=0,
-                u=UNION(mi=MI(dx=1, dy=0, dwFlags=0x0001))
-            )
-        )
-        self.wait(0.003)
+        self.move_to(h, x, y)
 
-        # C# projesindeki Nudge(-1, 0)
+        U.ScreenToClient.argtypes = [W.HWND, C.POINTER(W.POINT)]
+        U.ScreenToClient.restype = W.BOOL
+        U.PostMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
+        U.PostMessageW.restype = W.BOOL
+
+        p = W.POINT(int(x), int(y))
+        U.ScreenToClient(h, C.byref(p))
+        lp = (p.y << 16) | (p.x & 0xFFFF)
+
         self.guard(h)
-        self.send(
-            INPUT(
-                type=0,
-                u=UNION(mi=MI(dx=-1, dy=0, dwFlags=0x0001))
-            )
-        )
-        self.wait(0.003)
-
-        self.wait(0.060)
-        self.guard(h)
-
-        after = position()
-        self.say(f"FARE: hareket sonrasi={after}")
-
-        distance = (
-            (after[0] - x) ** 2 + (after[1] - y) ** 2
-        ) ** 0.5
-
-        if distance > 8:
-            raise RuntimeError(
-                f"Imlec hedefe ulasmadi; fark={distance:.1f}px. "
-                "Guvenlik nedeniyle tiklama gonderilmedi."
-            )
-
-        self.send(
-            INPUT(type=0, u=UNION(mi=MI(dwFlags=0x0002)))
-        )
-        try:
-            self.wait(0.12)
-        finally:
-            self.send(
-                INPUT(type=0, u=UNION(mi=MI(dwFlags=0x0004)))
-            )
-
-        self.say(
-            "Sol tus bas/birak komutlari gonderildi; "
-            "oyun ici secim ayrica dogrulanacak."
-        )
+        U.PostMessageW(h, 0x0200, 0, lp); self.wait(0.03)   # WM_MOUSEMOVE
+        U.PostMessageW(h, 0x0201, 1, lp); self.wait(0.08)   # WM_LBUTTONDOWN
+        U.PostMessageW(h, 0x0202, 0, lp)                    # WM_LBUTTONUP
+        self.say(f"TIKLAMA (PostMessage): client ({p.x},{p.y})")
     NAMED_KEYS={'tab':0x09,'space':0x20,'enter':0x0D,'esc':0x1B,'shift':0x10,'ctrl':0x11,'alt':0x12}
     def keylist(self,text):
         keys=[]
@@ -678,7 +643,7 @@ class App:
             self.say('5 saniye icinde listeden sectigin oyuna gec. Insert durdurur.'); self.wait(5)
             live=c['mode']!='Dry'
             if live: self.guard(h)
-            keys=self.keylist(c['skills']); nextclick=0; lastreport=0; engaged=False; since=0; idx=0; confirmations=0
+            keys=self.keylist(c['skills']); nextclick=0; lastreport=0; engaged=False; since=0; idx=0; confirmations=0; last_wolf=0
             basic=c.get('basic_attack') or {'key': 'R', 'interval': 1.0}
             basic_vk=self.keylist(basic['key'])[0]
             basic_interval=float(basic.get('interval', 1.0))
@@ -690,12 +655,14 @@ class App:
             with mss.mss() as sct:
                 def verify():
                     self.guard(h)
+                    self._vc += 1
                     im = self.capture(sct, h)
                     debug_dir = ROOT / 'debug'
                     debug_dir.mkdir(exist_ok=True)
-                    ok, full_data = cv2.imencode('.png', im)
-                    if ok:
-                        full_data.tofile(str(debug_dir / 'full_latest.png'))
+                    if self._vc % 5 == 0:
+                        ok, full_data = cv2.imencode('.png', im)
+                        if ok:
+                            full_data.tofile(str(debug_dir / 'full_latest.png'))
                     panel = self.cut(im, c['region']['panel'])
 
                     panel, panel_template = clean_panel_colors(
@@ -721,13 +688,14 @@ class App:
                         ).astype(np.uint8),
                     }
 
-                    for filename, image in images.items():
-                        ok, encoded = cv2.imencode('.png', image)
-                        if not ok:
-                            raise RuntimeError(
-                                'Teshis goruntusu kodlanamadi'
-                            )
-                        encoded.tofile(str(debug_dir / filename))
+                    if self._vc % 3 == 0:
+                        for filename, image in images.items():
+                            ok, encoded = cv2.imencode('.png', image)
+                            if not ok:
+                                raise RuntimeError(
+                                    'Teshis goruntusu kodlanamadi'
+                                )
+                            encoded.tofile(str(debug_dir / filename))
 
                     measured = detect(
                         panel,
@@ -779,9 +747,15 @@ class App:
                         )
                         if red_ratio < 0.02:
                             engaged=False
+                            last_dead=np.array([x+w/2, y+hh/2]); dead_until=time.monotonic()+2.0
                             self.say(f'Mob oldu; can bari kayboldu (kirmizi={red_ratio:.3f}). Yeni aday aranacak')
                             continue
                         now=time.monotonic()
+                        if self.vars['wolf_enabled'].get() and now-last_wolf>=2.0:
+                            self.key(h, self.keylist(self.vars['wolf_f_key'].get())[0])
+                            self.wait(0.05)
+                            self.key(h, self.keylist(self.vars['wolf_slot'].get())[0])
+                            last_wolf=time.monotonic()
                         skill_used=False
                         for s in rotation:
                             if now-last_used.get(s['_vk'],0)>=float(s.get('cooldown',0)):
