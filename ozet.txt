@@ -1,0 +1,101 @@
+app.py satir: 845
+
+=== VARLIK KONTROLU ===
+Genel Farm: VAR
+hp_ratio: VAR
+target_key: VAR
+NAMED_KEYS: VAR
+red_ratio: VAR
+clean_panel_colors: VAR
+run_panel_test: VAR
+0x0008: VAR
+
+=== FONKSIYONLAR ===
+def windows()
+def cb(h,p)
+def geometry(h)
+def feature(bgr,color)
+def detect(image,templ,color,threshold,scales)
+def clean_panel_colors(panel, template, color)
+    def filtered(image)
+def __init__(self,root)
+    def say(self,s)
+def active(self)
+def refresh(self)
+def hwnd(self)
+def hotkey(self)
+def close(self)
+def toggle_preview(self)
+def poll(self)
+def capture(self,sct,h)
+def pick(self,key,sample)
+def capture_target(self)
+def do_pick(self,h,key,sample)
+def settings(self)
+def folder(self)
+def save(self)
+def load(self)
+def start(self)
+def wait(self,t)
+def guard(self,h)
+def send(self,i)
+def key(self,h,vk)
+def cursor(self)
+    def dist_to(self, pos, x, y)
+    def move_to(self, h, x, y)
+    def click(self, h, x, y)
+def keylist(self,text)
+def cut(self,image,r)
+def hp_ratio(self,sct,h,c)
+def run_panel_test(self, h, c, samples)
+    def run(self,h,c,samples)
+    def verify()
+
+=== MOD LISTESI ===
+'Dry', 'Panel test', 'Click test', 'Farm', 'Z Farm', 'Genel Farm'
+'red', 'purple', 'light'
+
+=== AYAR ALANLARI ===
+scene_color = red (secim=True)
+panel_color = purple (secim=True)
+threshold = 0.80 (secim=False)
+offset = 30 (secim=False)
+skills = R (secim=False)
+target_key = Z (secim=False)
+delay = 0.30 (secim=False)
+timeout = 20 (secim=False)
+
+=== KURULUM BUTONLARI ===
+1 Oyun Ekran Alanı -> scene (ornek=False)
+2 Seçilen Mob Ad Alanı -> panel (ornek=False)
+3 Ekranda Mob Adı Örneği -> scene (ornek=True)
+4 Seçilen Mob Adı Örneği -> panel (ornek=True)
+5 Can Barı Alanı -> hp (ornek=False)
+
+=== mode KONTROLLERI ===
+Panel test
+Genel Farm
+Panel test
+Dry
+Z Farm
+Genel Farm
+Click test
+
+=== required BLOGU ===
+==c['mode'].strip().lower()),c['mode'])
+            if c['mode']=='Panel test': required=['panel']
+            elif c['mode'] in ('Z Farm','Genel Farm'): required=['panel','hp']
+            else: required=['scene','panel','hp']
+            sample_required=[k for k in required if k in ('scene','panel')]
+            region_required=[k for k in required if k in ('scene','panel','h
+
+=== ESIK DEGERLERI (kullanim sayisi) ===
+0.55: 5
+0.02: 2
+0.01: 4
+0.80: 1
+0.30: 2
+
+=== PROFILLER ===
+profiles\Hob Goblin\config.json region=['scene', 'panel', 'hp'] mode=Genel Farm target_key=Z skills=R
+profiles\Worm\config.json region=['scene', 'panel'] mode=Dry target_key=None skills=f1,1,R
